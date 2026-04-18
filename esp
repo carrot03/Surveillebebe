@@ -1,0 +1,238 @@
+#define BLYNK_TEMPLATE_ID "TMPL2taT-FPuL"
+#define BLYNK_TEMPLATE_NAME "SurveilBebe"
+#define BLYNK_AUTH_TOKEN "xxxxxxxxxxxxxx"
+
+#include <ESP8266WiFi.h>
+#include <BlynkSimpleEsp8266.h>
+
+// =========================
+// WiFi
+// =========================
+char ssid[] = "xxx";
+char pass[] = "xxxxx";
+
+// =========================
+// Data structure
+// =========================
+struct SensorData {
+  float bodyTemp;
+  float ambientTemp;
+  float humidity;
+  int smokeLevel;
+  int motionDuration;
+  int soundLevel;
+  int heartRate;
+  int spO2;
+};
+
+SensorData data;
+BlynkTimer timer;
+
+// =========================
+// Alert state flags
+// =========================
+bool smokeAlertSent = false;
+bool motionAlertSent = false;
+bool soundAlertSent = false;
+bool tempHumidAlertSent = false;
+bool heartRateAlertSent = false;
+bool bodyTempAlertSent = false;
+bool spo2AlertSent = false;
+
+// =========================
+// Function prototypes
+// =========================
+void connectWiFi();
+void connectBlynk();
+void maintainConnections();
+void readFromArduino();
+void parseData(String msg);
+float extractFloat(const String &dataStr, const String &key);
+void sendToBlynk();
+
+void setup() {
+  // Hardware serial used to receive data from Arduino
+  Serial.begin(9600);
+  Serial.setTimeout(50);
+
+  // Init defaults
+  data.bodyTemp = 0.0;
+  data.ambientTemp = 0.0;
+  data.humidity = 0.0;
+  data.smokeLevel = 0;
+  data.motionDuration = 0;
+  data.soundLevel = 0;
+  data.heartRate = 0;
+  data.spO2 = 0;
+
+  connectWiFi();
+  Blynk.config(BLYNK_AUTH_TOKEN);
+  connectBlynk();
+
+  timer.setInterval(2000L, sendToBlynk);
+}
+
+void loop() {
+  maintainConnections();
+  Blynk.run();
+  timer.run();
+  readFromArduino();
+}
+
+void connectWiFi() {
+  WiFi.begin(ssid, pass);
+
+  unsigned long startAttemptTime = millis();
+  const unsigned long wifiTimeout = 15000; // 15 seconds
+
+  while (WiFi.status() != WL_CONNECTED &&
+         millis() - startAttemptTime < wifiTimeout) {
+    delay(500);
+  }
+}
+
+void connectBlynk() {
+  if (WiFi.status() == WL_CONNECTED) {
+    Blynk.connect(5000); // try for 5 seconds
+  }
+}
+
+void maintainConnections() {
+  if (WiFi.status() != WL_CONNECTED) {
+    connectWiFi();
+    return;
+  }
+
+  if (!Blynk.connected()) {
+    connectBlynk();
+  }
+}
+
+void readFromArduino() {
+  while (Serial.available()) {
+    String msg = Serial.readStringUntil('\n');
+    msg.trim();
+
+    if (msg.length() > 0) {
+      parseData(msg);
+    }
+  }
+}
+
+void parseData(String msg) {
+  data.bodyTemp       = extractFloat(msg, "BT:");
+  data.heartRate      = (int)extractFloat(msg, "HR:");
+  data.spO2           = (int)extractFloat(msg, "SP:");
+  data.ambientTemp    = extractFloat(msg, "AT:");
+  data.humidity       = extractFloat(msg, "HU:");
+  data.smokeLevel     = (int)extractFloat(msg, "SM:");
+  data.motionDuration = (int)extractFloat(msg, "MO:");
+  data.soundLevel     = (int)extractFloat(msg, "SO:");
+}
+
+float extractFloat(const String &dataStr, const String &key) {
+  int idx = dataStr.indexOf(key);
+  if (idx == -1) return 0.0;
+
+  int start = idx + key.length();
+  int end = dataStr.indexOf(',', start);
+  if (end == -1) {
+    end = dataStr.length();
+  }
+
+  return dataStr.substring(start, end).toFloat();
+}
+
+void sendToBlynk() {
+  if (WiFi.status() != WL_CONNECTED || !Blynk.connected()) {
+    return;
+  }
+
+  // Send values to widgets
+  Blynk.virtualWrite(V0, data.ambientTemp);
+  Blynk.virtualWrite(V1, data.humidity);
+  Blynk.virtualWrite(V2, data.smokeLevel);
+  Blynk.virtualWrite(V3, data.motionDuration);
+  Blynk.virtualWrite(V4, data.soundLevel);
+  Blynk.virtualWrite(V5, data.heartRate);
+  Blynk.virtualWrite(V6, data.bodyTemp);
+  Blynk.virtualWrite(V7, data.spO2);
+
+  // Smoke alert
+  if (data.smokeLevel > 500) {
+    if (!smokeAlertSent) {
+      Blynk.logEvent("alerte_fumee", "DANGER : Fumee detectee dans la chambre !");
+      smokeAlertSent = true;
+    }
+  } else {
+    smokeAlertSent = false;
+  }
+
+  // Motion alert
+  if (data.motionDuration > 4) {
+    if (!motionAlertSent) {
+      Blynk.logEvent("alerte_motion", "DANGER : Bebe n'a pas bouge depuis 4 s !");
+      motionAlertSent = true;
+    }
+  } else {
+    motionAlertSent = false;
+  }
+
+  // Sound alert
+  if (data.soundLevel > 200) {
+    if (!soundAlertSent) {
+      Blynk.logEvent("alerte_sound", "ATTENTION : Bebe pleure !");
+      soundAlertSent = true;
+    }
+  } else {
+    soundAlertSent = false;
+  }
+
+  // Heart rate alert
+  bool badHeartRate = (data.heartRate > 0) && (data.heartRate < 120 || data.heartRate > 180);
+
+  if (badHeartRate) {
+    if (!heartRateAlertSent) {
+      Blynk.logEvent("heart_rate_alert", "DANGER : La frequence cardiaque est anormale !");
+      heartRateAlertSent = true;
+    }
+  } else {
+    heartRateAlertSent = false;
+  }
+
+  // Body temperature alert
+  bool badBodyTemp = (data.bodyTemp > 0.0) && (data.bodyTemp < 36.0 || data.bodyTemp > 37.5);
+
+  if (badBodyTemp) {
+    if (!bodyTempAlertSent) {
+      Blynk.logEvent("body_temp_alert", "DANGER : La temperature corporelle est anormale !");
+      bodyTempAlertSent = true;
+    }
+  } else {
+    bodyTempAlertSent = false;
+  }
+
+  // SpO2 alert
+  bool badSpO2 = (data.spO2 > 0) && (data.spO2 < 95);
+
+  if (badSpO2) {
+    if (!spo2AlertSent) {
+      Blynk.logEvent("spo2_alert", "DANGER : Le niveau d'oxygene est bas !");
+      spo2AlertSent = true;
+    }
+  } else {
+    spo2AlertSent = false;
+  }
+
+  // Temperature / humidity alert
+  // bool badTempHumid = (data.ambientTemp > 22.2 || data.ambientTemp < 20.0 || data.humidity > 55.0);
+
+  // if (badTempHumid) {
+  //   if (!tempHumidAlertSent) {
+  //     Blynk.logEvent("temp_humid_alert", "DANGER : La temperature ou l'humidite de la chambre est anormale !");
+  //     tempHumidAlertSent = true;
+  //   }
+  // } else {
+  //   tempHumidAlertSent = false;
+  // }
+}
