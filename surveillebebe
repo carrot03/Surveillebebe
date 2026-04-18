@@ -1,0 +1,876 @@
+#include <Arduino_FreeRTOS.h>
+#include <queue.h>
+#include <semphr.h>
+#include <Wire.h>
+#include <LiquidCrystal.h>
+#include <MPU6050.h>
+#include <MAX30105.h>
+#include <heartRate.h>
+#include <spo2_algorithm.h>
+#include <DHT.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <math.h>
+
+// ============================================================
+// PINS
+// ============================================================
+#define PIN_DHT22        2
+#define PIN_MQ2_DIGITAL  3
+#define PIN_LED_R        5
+#define PIN_LED_G        8
+#define PIN_LED_B        7
+#define PIN_BUZZER       10
+#define PIN_FAN          9
+#define PIN_LED_YELLOW   6
+#define PIN_BUTTON       12
+#define PIN_MQ2_ANALOG   A1
+#define PIN_SOUND        A9
+#define PIN_DS18B20      A0
+
+// ============================================================
+// LCD
+// ============================================================
+LiquidCrystal lcd(22, 23, 24, 25, 26, 27);
+
+// ============================================================
+// THRESHOLDS
+// ============================================================
+#define BODY_TEMP_MIN     36.0
+#define BODY_TEMP_MAX     37.5
+#define HEART_MIN         120
+#define HEART_MAX         180
+#define SPO2_MIN          95
+#define AMBIENT_TEMP_MIN  20.0
+#define AMBIENT_TEMP_MAX  22.2
+#define HUMIDITY_MAX      55.0
+#define SMOKE_THRESHOLD   500
+#define MOTION_WARN_SEC   10
+#define MOTION_ALERT_SEC  20
+#define SOUND_THRESHOLD   200
+
+// ============================================================
+// HEART TASK CONFIG
+// ============================================================
+#define HR_SAMPLE_PERIOD_MS        40
+#define HR_WINDOW_SECONDS          4
+#define HR_NUM_SAMPLES             (HR_WINDOW_SECONDS * 1000 / HR_SAMPLE_PERIOD_MS)
+#define HR_IDLE_BETWEEN_BLOCKS_MS  2000
+#define HR_BASELINE_SAMPLES        50
+#define HR_FINGER_MARGIN           8000.0f
+#define HR_MIN_IR_FOR_FINGER       15000
+
+// ============================================================
+// ALARMS
+// ============================================================
+#define ALARM_SMOKE         (1 << 0)
+#define ALARM_HEART_LOW     (1 << 1)
+#define ALARM_HEART_HIGH    (1 << 2)
+#define ALARM_MOTION        (1 << 3)
+#define ALARM_HUMIDITY      (1 << 4)
+#define ALARM_AMBIENT_TEMP  (1 << 5)
+#define ALARM_SOUND         (1 << 6)
+#define ALARM_BODY_TEMP     (1 << 7)
+
+// ============================================================
+// SHARED DATA
+// ============================================================
+typedef struct {
+  float bodyTemp;
+  int   heartRate;
+  int   spO2;
+  float ambientTemp;
+  float humidity;
+  int   smokeLevel;
+  bool  motionAlert;
+  int   motionDuration;
+  int   alarmFlags;
+  int   soundLevel;
+} SensorData_t;
+
+// ============================================================
+// FREERTOS OBJECTS
+// ============================================================
+QueueHandle_t     xQueueSensorData;
+SemaphoreHandle_t xMutexI2C;
+SemaphoreHandle_t xMutexGlobalData;
+SemaphoreHandle_t xSemAlarm;
+SemaphoreHandle_t xMutexSerial;
+
+// ============================================================
+// SENSOR OBJECTS
+// ============================================================
+MPU6050  mpu;
+MAX30105 particleSensor;
+DHT      dht(PIN_DHT22, DHT22);
+OneWire oneWire(PIN_DS18B20);
+DallasTemperature bodyTempSensor(&oneWire);
+
+// ============================================================
+// GLOBALS
+// ============================================================
+SensorData_t globalData;
+uint32_t g_irBuffer[HR_NUM_SAMPLES];
+uint32_t g_redBuffer[HR_NUM_SAMPLES];
+
+// ============================================================
+// PROTOTYPES
+// ============================================================
+void TaskHeartRate(void *pvParameters);
+void TaskMotion(void *pvParameters);
+void TaskEnvMonitor(void *pvParameters);
+void TaskSmoke(void *pvParameters);
+void TaskSound(void *pvParameters);
+void TaskWiFiSend(void *pvParameters);
+void TaskLCD(void *pvParameters);
+void TaskBodyTemp(void *pvParameters);
+void updateActuators(const SensorData_t &data);
+
+// ============================================================
+// SETUP
+// ============================================================
+void setup() {
+  Serial.begin(115200);
+  Serial1.begin(9600);
+
+  lcd.begin(16, 2);
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("BabySafe Monitor");
+  lcd.setCursor(0, 1);
+  lcd.print("Initialisation");
+
+  pinMode(PIN_BUZZER,      OUTPUT);
+  pinMode(PIN_FAN,         OUTPUT);
+  pinMode(PIN_LED_R,       OUTPUT);
+  pinMode(PIN_LED_G,       OUTPUT);
+  pinMode(PIN_LED_B,       OUTPUT);
+  pinMode(PIN_LED_YELLOW,  OUTPUT);
+  pinMode(PIN_MQ2_DIGITAL, INPUT);
+  pinMode(PIN_BUTTON,      INPUT_PULLUP);
+  pinMode(PIN_SOUND,       INPUT);
+
+  digitalWrite(PIN_BUZZER, LOW);
+  digitalWrite(PIN_FAN, LOW);
+  digitalWrite(PIN_LED_R, LOW);
+  digitalWrite(PIN_LED_G, LOW);
+  digitalWrite(PIN_LED_B, LOW);
+  digitalWrite(PIN_LED_YELLOW, LOW);
+
+  Wire.begin();
+  dht.begin();
+  mpu.initialize();
+  bodyTempSensor.begin();
+
+  Serial.println("[Setup] Before MAX30102 begin");
+
+  if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
+    Serial.println("[Heart] MAX30102 not found");
+  } else {
+    Serial.println("[Setup] MAX30102 begin OK");
+
+    byte ledBrightness = 0x2F;
+    byte sampleAverage = 4;
+    byte ledMode = 2;
+    int sampleRate = 100;
+    int pulseWidth = 411;
+    int adcRange = 4096;
+
+    particleSensor.setup(
+      ledBrightness,
+      sampleAverage,
+      ledMode,
+      sampleRate,
+      pulseWidth,
+      adcRange
+    );
+
+    particleSensor.setPulseAmplitudeRed(0x2F);
+    particleSensor.setPulseAmplitudeIR(0x2F);
+    particleSensor.setPulseAmplitudeGreen(0);
+
+    Serial.println("[Setup] MAX30102 setup done");
+  }
+
+  globalData.bodyTemp       = 0;
+  globalData.heartRate      = 0;
+  globalData.spO2           = 0;
+  globalData.ambientTemp    = 0;
+  globalData.humidity       = 0;
+  globalData.smokeLevel     = 0;
+  globalData.motionAlert    = false;
+  globalData.motionDuration = 0;
+  globalData.alarmFlags     = 0;
+  globalData.soundLevel     = 0;
+
+  xQueueSensorData = xQueueCreate(10, sizeof(SensorData_t));
+  xMutexI2C        = xSemaphoreCreateMutex();
+  xMutexGlobalData = xSemaphoreCreateMutex();
+  xSemAlarm        = xSemaphoreCreateBinary();
+  xMutexSerial     = xSemaphoreCreateMutex();
+
+  xTaskCreate(TaskSmoke,      "Smoke",    256, NULL, 2, NULL);
+  xTaskCreate(TaskHeartRate,  "Heart",    512, NULL, 3, NULL);
+  xTaskCreate(TaskEnvMonitor, "Env",      384, NULL, 2, NULL);
+  xTaskCreate(TaskMotion,     "Motion",   512, NULL, 3, NULL);
+  xTaskCreate(TaskSound,      "Sound",    256, NULL, 2, NULL);
+  xTaskCreate(TaskBodyTemp,   "BodyTemp", 256, NULL, 2, NULL);
+  xTaskCreate(TaskWiFiSend,   "WiFi",     256, NULL, 1, NULL);
+  xTaskCreate(TaskLCD,        "LCD",      256, NULL, 1, NULL);
+
+  if (xSemaphoreTake(xMutexSerial, pdMS_TO_TICKS(20)) == pdTRUE) {
+    Serial.println("System init complete. Starting scheduler...");
+    Serial.println("[Mode] Using REAL sensors only");
+    xSemaphoreGive(xMutexSerial);
+  }
+
+  vTaskStartScheduler();
+}
+
+void loop() {}
+
+// ============================================================
+// ACTUATORS
+// ============================================================
+void updateActuators(const SensorData_t &data) {
+  bool highHumidity   = (data.humidity > HUMIDITY_MAX);
+  bool lowAmbientTemp = (data.ambientTemp < AMBIENT_TEMP_MIN);
+  bool highAmbientTemp = (data.ambientTemp > AMBIENT_TEMP_MAX);
+  bool badHeart = (data.heartRate > 0 && (data.heartRate < HEART_MIN || data.heartRate > HEART_MAX));
+  bool noMovementWarn = (data.motionDuration >= MOTION_WARN_SEC);
+
+  // Green LED = high humidity
+  digitalWrite(PIN_LED_G, highHumidity ? HIGH : LOW);
+
+  // Red LED = no movement OR low ambient temperature
+  digitalWrite(PIN_LED_R, (noMovementWarn || lowAmbientTemp) ? HIGH : LOW);
+
+  // Yellow LED = abnormal heart rate
+  digitalWrite(PIN_LED_YELLOW, badHeart ? HIGH : LOW);
+
+  // Fan = high ambient temperature
+  digitalWrite(PIN_FAN, highAmbientTemp ? HIGH : LOW);
+
+  // Blue LED not used
+  digitalWrite(PIN_LED_B, LOW);
+
+  // Buzzer for strong alerts
+  if ((data.alarmFlags & ALARM_SMOKE) || (data.motionDuration >= MOTION_ALERT_SEC)) {
+    digitalWrite(PIN_BUZZER, HIGH);
+  } else {
+    digitalWrite(PIN_BUZZER, LOW);
+  }
+}
+
+// ============================================================
+// TASK: Smoke
+// ============================================================
+void TaskSmoke(void *pvParameters) {
+  vTaskDelay(pdMS_TO_TICKS(300));
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+
+  for (;;) {
+    int smokeVal = analogRead(PIN_MQ2_ANALOG);
+
+    if (xSemaphoreTake(xMutexGlobalData, pdMS_TO_TICKS(10)) == pdTRUE) {
+      globalData.smokeLevel = smokeVal;
+
+      if (smokeVal > SMOKE_THRESHOLD) {
+        globalData.alarmFlags |= ALARM_SMOKE;
+      } else {
+        globalData.alarmFlags &= ~ALARM_SMOKE;
+      }
+
+      xSemaphoreGive(xMutexGlobalData);
+    }
+
+    if (xSemaphoreTake(xMutexSerial, pdMS_TO_TICKS(20)) == pdTRUE) {
+      Serial.print("[Smoke] smokeLevel = ");
+      Serial.println(smokeVal);
+      xSemaphoreGive(xMutexSerial);
+    }
+
+    if (smokeVal > SMOKE_THRESHOLD) {
+      xSemaphoreGive(xSemAlarm);
+    }
+
+    vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(12000));
+  }
+}
+
+// ============================================================
+// TASK: Heart Rate + SpO2
+// ============================================================
+void TaskHeartRate(void *pvParameters) {
+  vTaskDelay(pdMS_TO_TICKS(500));
+
+  uint32_t irBaseline = 0;
+  bool baselineReady = false;
+
+  int32_t spo2 = 0;
+  int8_t validSPO2 = 0;
+  int32_t heartRateCalc = 0;
+  int8_t validHeartRate = 0;
+
+  TickType_t xLastWakeTime;
+
+  for (;;) {
+    if (!baselineReady) {
+      uint32_t baselineSum = 0;
+      int validBaselineSamples = 0;
+
+      if (xSemaphoreTake(xMutexSerial, pdMS_TO_TICKS(20)) == pdTRUE) {
+        Serial.println("[Heart] Building IR baseline...");
+        xSemaphoreGive(xMutexSerial);
+      }
+
+      for (int i = 0; i < HR_BASELINE_SAMPLES; i++) {
+        uint32_t ir = 0;
+
+        if (xSemaphoreTake(xMutexI2C, pdMS_TO_TICKS(50)) == pdTRUE) {
+          ir = particleSensor.getIR();
+          xSemaphoreGive(xMutexI2C);
+        }
+
+        if (ir > 0) {
+          baselineSum += ir;
+          validBaselineSamples++;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(HR_SAMPLE_PERIOD_MS));
+      }
+
+      if (validBaselineSamples > 0) {
+        irBaseline = baselineSum / validBaselineSamples;
+        baselineReady = true;
+
+        if (xSemaphoreTake(xMutexSerial, pdMS_TO_TICKS(20)) == pdTRUE) {
+          Serial.print("[Heart] Baseline ready. IR baseline = ");
+          Serial.println(irBaseline);
+          xSemaphoreGive(xMutexSerial);
+        }
+      } else {
+        if (xSemaphoreTake(xMutexSerial, pdMS_TO_TICKS(20)) == pdTRUE) {
+          Serial.println("[Heart] Failed to build baseline, retrying...");
+          xSemaphoreGive(xMutexSerial);
+        }
+      }
+
+      vTaskDelay(pdMS_TO_TICKS(500));
+      continue;
+    }
+
+    uint32_t irNow = 0;
+    uint32_t redNow = 0;
+
+    if (xSemaphoreTake(xMutexI2C, pdMS_TO_TICKS(50)) == pdTRUE) {
+      irNow = particleSensor.getIR();
+      redNow = particleSensor.getRed();
+      xSemaphoreGive(xMutexI2C);
+    }
+
+    bool fingerPresent =
+      (irNow > HR_MIN_IR_FOR_FINGER) &&
+      (irNow > (irBaseline + HR_FINGER_MARGIN));
+
+    if (!fingerPresent) {
+      if (xSemaphoreTake(xMutexGlobalData, pdMS_TO_TICKS(20)) == pdTRUE) {
+        globalData.heartRate = 0;
+        globalData.spO2 = 0;
+        globalData.alarmFlags &= ~ALARM_HEART_LOW;
+        globalData.alarmFlags &= ~ALARM_HEART_HIGH;
+        xSemaphoreGive(xMutexGlobalData);
+      }
+
+      irBaseline = (irBaseline * 9UL + irNow) / 10UL;
+      vTaskDelay(pdMS_TO_TICKS(500));
+      continue;
+    }
+
+    xLastWakeTime = xTaskGetTickCount();
+
+    for (int i = 0; i < HR_NUM_SAMPLES; i++) {
+      uint32_t irValue = 0;
+      uint32_t redValue = 0;
+
+      if (xSemaphoreTake(xMutexI2C, pdMS_TO_TICKS(50)) == pdTRUE) {
+        irValue = particleSensor.getIR();
+        redValue = particleSensor.getRed();
+        xSemaphoreGive(xMutexI2C);
+      }
+
+      g_irBuffer[i] = irValue;
+      g_redBuffer[i] = redValue;
+
+      vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(HR_SAMPLE_PERIOD_MS));
+    }
+
+    maxim_heart_rate_and_oxygen_saturation(
+      g_irBuffer,
+      HR_NUM_SAMPLES,
+      g_redBuffer,
+      &spo2,
+      &validSPO2,
+      &heartRateCalc,
+      &validHeartRate
+    );
+
+    int hrToStore = 0;
+    int spo2ToStore = 0;
+
+    if (validHeartRate && heartRateCalc > 20 && heartRateCalc < 255) {
+      hrToStore = (int)heartRateCalc;
+    }
+
+    if (validSPO2 && spo2 > 70 && spo2 <= 100) {
+      spo2ToStore = (int)spo2;
+    }
+
+    if (xSemaphoreTake(xMutexGlobalData, pdMS_TO_TICKS(20)) == pdTRUE) {
+      globalData.heartRate = hrToStore;
+      globalData.spO2 = spo2ToStore;
+
+      if (hrToStore > 0 && hrToStore < HEART_MIN) {
+        globalData.alarmFlags |= ALARM_HEART_LOW;
+      } else {
+        globalData.alarmFlags &= ~ALARM_HEART_LOW;
+      }
+
+      if (hrToStore > HEART_MAX) {
+        globalData.alarmFlags |= ALARM_HEART_HIGH;
+      } else {
+        globalData.alarmFlags &= ~ALARM_HEART_HIGH;
+      }
+
+      xSemaphoreGive(xMutexGlobalData);
+    }
+
+    if (xSemaphoreTake(xMutexSerial, pdMS_TO_TICKS(20)) == pdTRUE) {
+      Serial.print("[Heart Block] HR=");
+      Serial.print(hrToStore);
+      Serial.print(" SpO2=");
+      Serial.println(spo2ToStore);
+      xSemaphoreGive(xMutexSerial);
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(HR_IDLE_BETWEEN_BLOCKS_MS));
+  }
+}
+
+// ============================================================
+// TASK: Motion
+// ============================================================
+void TaskMotion(void *pvParameters) {
+  vTaskDelay(pdMS_TO_TICKS(700));
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+  int16_t ax, ay, az, gx, gy, gz;
+  unsigned long lastMotionTime = millis();
+  int motionDuration = 0;
+
+  for (;;) {
+    bool gotI2C = false;
+
+    for (int attempt = 0; attempt < 3; attempt++) {
+      if (xSemaphoreTake(xMutexI2C, pdMS_TO_TICKS(100)) == pdTRUE) {
+        mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+        xSemaphoreGive(xMutexI2C);
+        gotI2C = true;
+        break;
+      }
+      vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    if (!gotI2C) {
+      if (xSemaphoreTake(xMutexSerial, pdMS_TO_TICKS(20)) == pdTRUE) {
+        Serial.println("[Motion] Failed to take I2C mutex after retries");
+        xSemaphoreGive(xMutexSerial);
+      }
+      vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(10000));
+      continue;
+    }
+
+    float magnitude = sqrt((float)ax * ax + (float)ay * ay + (float)az * az);
+    bool moving = (magnitude > 16700);
+
+    if (moving) {
+      lastMotionTime = millis();
+      motionDuration = 0;
+    } else {
+      motionDuration = (millis() - lastMotionTime) / 1000;
+    }
+
+    if (xSemaphoreTake(xMutexGlobalData, pdMS_TO_TICKS(20)) == pdTRUE) {
+      globalData.motionDuration = motionDuration;
+      globalData.motionAlert = (motionDuration >= MOTION_WARN_SEC);
+
+      if (motionDuration >= MOTION_ALERT_SEC) {
+        globalData.alarmFlags |= ALARM_MOTION;
+      } else {
+        globalData.alarmFlags &= ~ALARM_MOTION;
+      }
+
+      xSemaphoreGive(xMutexGlobalData);
+    }
+
+    if (motionDuration >= MOTION_ALERT_SEC) {
+      xSemaphoreGive(xSemAlarm);
+    }
+
+    if (xSemaphoreTake(xMutexSerial, pdMS_TO_TICKS(20)) == pdTRUE) {
+      Serial.print("[Motion] duration = ");
+      Serial.println(motionDuration);
+      xSemaphoreGive(xMutexSerial);
+    }
+
+    vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(10000));
+  }
+}
+
+// ============================================================
+// TASK: Environment
+// ============================================================
+void TaskEnvMonitor(void *pvParameters) {
+  vTaskDelay(pdMS_TO_TICKS(900));
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+
+  for (;;) {
+    float humidity = dht.readHumidity();
+    float ambientTemp = dht.readTemperature();
+
+    if (isnan(humidity) || isnan(ambientTemp)) {
+      if (xSemaphoreTake(xMutexSerial, pdMS_TO_TICKS(20)) == pdTRUE) {
+        Serial.println("[Env] DHT read failed");
+        xSemaphoreGive(xMutexSerial);
+      }
+      vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(15000));
+      continue;
+    }
+
+    SensorData_t localCopy;
+
+    if (xSemaphoreTake(xMutexGlobalData, pdMS_TO_TICKS(20)) == pdTRUE) {
+      globalData.ambientTemp = ambientTemp;
+      globalData.humidity = humidity;
+
+      if (humidity > HUMIDITY_MAX) {
+        globalData.alarmFlags |= ALARM_HUMIDITY;
+      } else {
+        globalData.alarmFlags &= ~ALARM_HUMIDITY;
+      }
+
+      if (ambientTemp < AMBIENT_TEMP_MIN || ambientTemp > AMBIENT_TEMP_MAX) {
+        globalData.alarmFlags |= ALARM_AMBIENT_TEMP;
+      } else {
+        globalData.alarmFlags &= ~ALARM_AMBIENT_TEMP;
+      }
+
+      localCopy = globalData;
+      xSemaphoreGive(xMutexGlobalData);
+    } else {
+      vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(15000));
+      continue;
+    }
+
+    updateActuators(localCopy);
+
+    if (humidity > HUMIDITY_MAX || ambientTemp < AMBIENT_TEMP_MIN || ambientTemp > AMBIENT_TEMP_MAX) {
+      xSemaphoreGive(xSemAlarm);
+    }
+
+    if (xSemaphoreTake(xMutexSerial, pdMS_TO_TICKS(20)) == pdTRUE) {
+      Serial.print("[Env] AT=");
+      Serial.print(ambientTemp, 1);
+      Serial.print(" HU=");
+      Serial.println(humidity, 1);
+      xSemaphoreGive(xMutexSerial);
+    }
+
+    vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(15000));
+  }
+}
+
+// ============================================================
+// TASK: Body Temperature (DS18B20)
+// ============================================================
+void TaskBodyTemp(void *pvParameters) {
+  vTaskDelay(pdMS_TO_TICKS(800));
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+
+  for (;;) {
+    bodyTempSensor.requestTemperatures();
+    float bodyTemp = bodyTempSensor.getTempCByIndex(0);
+
+    if (bodyTemp == DEVICE_DISCONNECTED_C || bodyTemp < -20.0 || bodyTemp > 60.0) {
+      if (xSemaphoreTake(xMutexSerial, pdMS_TO_TICKS(20)) == pdTRUE) {
+        Serial.println("[BodyTemp] DS18B20 read failed");
+        xSemaphoreGive(xMutexSerial);
+      }
+      vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(3000));
+      continue;
+    }
+
+    if (xSemaphoreTake(xMutexGlobalData, pdMS_TO_TICKS(20)) == pdTRUE) {
+      globalData.bodyTemp = bodyTemp;
+
+      if (bodyTemp < BODY_TEMP_MIN || bodyTemp > BODY_TEMP_MAX) {
+        globalData.alarmFlags |= ALARM_BODY_TEMP;
+      } else {
+        globalData.alarmFlags &= ~ALARM_BODY_TEMP;
+      }
+
+      xSemaphoreGive(xMutexGlobalData);
+    }
+
+    if (xSemaphoreTake(xMutexSerial, pdMS_TO_TICKS(20)) == pdTRUE) {
+      Serial.print("[BodyTemp] BT=");
+      Serial.println(bodyTemp, 1);
+      xSemaphoreGive(xMutexSerial);
+    }
+
+    vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(3000));
+  }
+}
+
+// ============================================================
+// TASK: Sound
+// ============================================================
+void TaskSound(void *pvParameters) {
+  vTaskDelay(pdMS_TO_TICKS(1000));
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+
+  for (;;) {
+    int soundVal = analogRead(PIN_SOUND);
+
+    if (xSemaphoreTake(xMutexGlobalData, pdMS_TO_TICKS(20)) == pdTRUE) {
+      globalData.soundLevel = soundVal;
+
+      if (soundVal > SOUND_THRESHOLD) {
+        globalData.alarmFlags |= ALARM_SOUND;
+      } else {
+        globalData.alarmFlags &= ~ALARM_SOUND;
+      }
+
+      xSemaphoreGive(xMutexGlobalData);
+    }
+
+    if (soundVal > SOUND_THRESHOLD) {
+      xSemaphoreGive(xSemAlarm);
+    }
+
+    if (xSemaphoreTake(xMutexSerial, pdMS_TO_TICKS(20)) == pdTRUE) {
+      Serial.print("[Sound] level = ");
+      Serial.println(soundVal);
+      xSemaphoreGive(xMutexSerial);
+    }
+
+    vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(10000));
+  }
+}
+
+// ============================================================
+// TASK: WiFi Send
+// ============================================================
+void TaskWiFiSend(void *pvParameters) {
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+
+  for (;;) {
+    SensorData_t data;
+
+    if (xSemaphoreTake(xMutexGlobalData, pdMS_TO_TICKS(50)) == pdTRUE) {
+      data = globalData;
+      xSemaphoreGive(xMutexGlobalData);
+    } else {
+      vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(5000));
+      continue;
+    }
+
+    Serial1.print("BT:");
+    Serial1.print(data.bodyTemp, 1);
+    Serial1.print(",HR:");
+    Serial1.print(data.heartRate);
+    Serial1.print(",SP:");
+    Serial1.print(data.spO2);
+    Serial1.print(",AT:");
+    Serial1.print(data.ambientTemp, 1);
+    Serial1.print(",HU:");
+    Serial1.print(data.humidity, 1);
+    Serial1.print(",SM:");
+    Serial1.print(data.smokeLevel);
+    Serial1.print(",MO:");
+    Serial1.print(data.motionDuration);
+    Serial1.print(",SO:");
+    Serial1.print(data.soundLevel);
+    Serial1.print(",AL:");
+    Serial1.print(data.alarmFlags);
+    Serial1.println();
+
+    if (xSemaphoreTake(xMutexSerial, pdMS_TO_TICKS(20)) == pdTRUE) {
+      Serial.print("[WiFi] BT:");
+      Serial.print(data.bodyTemp, 1);
+      Serial.print(",HR:");
+      Serial.print(data.heartRate);
+      Serial.print(",SP:");
+      Serial.print(data.spO2);
+      Serial.print(",AT:");
+      Serial.print(data.ambientTemp, 1);
+      Serial.print(",HU:");
+      Serial.print(data.humidity, 1);
+      Serial.print(",SM:");
+      Serial.print(data.smokeLevel);
+      Serial.print(",MO:");
+      Serial.print(data.motionDuration);
+      Serial.print(",SO:");
+      Serial.print(data.soundLevel);
+      Serial.print(",AL:");
+      Serial.println(data.alarmFlags);
+      xSemaphoreGive(xMutexSerial);
+    }
+
+    vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(5000));
+  }
+}
+
+// ============================================================
+// TASK: LCD
+// ============================================================
+void TaskLCD(void *pvParameters) {
+  vTaskDelay(pdMS_TO_TICKS(1000));
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+  int screenIndex = 0;
+
+  for (;;) {
+    SensorData_t data;
+
+    if (xSemaphoreTake(xMutexGlobalData, pdMS_TO_TICKS(50)) == pdTRUE) {
+      data = globalData;
+      xSemaphoreGive(xMutexGlobalData);
+    } else {
+      vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(2000));
+      continue;
+    }
+
+    lcd.clear();
+
+    if (data.alarmFlags & ALARM_SMOKE) {
+      lcd.setCursor(0, 0);
+      lcd.print("ALERTE FUMEE");
+      lcd.setCursor(0, 1);
+      lcd.print("Niv:");
+      lcd.print(data.smokeLevel);
+    }
+    else if (data.alarmFlags & ALARM_MOTION) {
+      lcd.setCursor(0, 0);
+      lcd.print("PAS MOUVEMENT");
+      lcd.setCursor(0, 1);
+      lcd.print(data.motionDuration);
+      lcd.print(" s");
+    }
+    else if (data.alarmFlags & ALARM_AMBIENT_TEMP) {
+      lcd.setCursor(0, 0);
+      lcd.print("TEMP ANORMALE");
+      lcd.setCursor(0, 1);
+      lcd.print(data.ambientTemp, 1);
+      lcd.print((char)223);
+      lcd.print("C");
+    }
+    else if (data.alarmFlags & ALARM_HUMIDITY) {
+      lcd.setCursor(0, 0);
+      lcd.print("HUMIDITE HAUTE");
+      lcd.setCursor(0, 1);
+      lcd.print(data.humidity, 1);
+      lcd.print("%");
+    }
+    else if (data.alarmFlags & ALARM_SOUND) {
+      lcd.setCursor(0, 0);
+      lcd.print("BRUIT ELEVE");
+      lcd.setCursor(0, 1);
+      lcd.print("Niv:");
+      lcd.print(data.soundLevel);
+    }
+    else if (data.alarmFlags & ALARM_HEART_LOW) {
+      lcd.setCursor(0, 0);
+      lcd.print("COEUR TROP BAS");
+      lcd.setCursor(0, 1);
+      lcd.print("HR:");
+      lcd.print(data.heartRate);
+      lcd.print(" SP:");
+      lcd.print(data.spO2);
+    }
+    else if (data.alarmFlags & ALARM_HEART_HIGH) {
+      lcd.setCursor(0, 0);
+      lcd.print("COEUR TROP HAUT");
+      lcd.setCursor(0, 1);
+      lcd.print("HR:");
+      lcd.print(data.heartRate);
+      lcd.print(" SP:");
+      lcd.print(data.spO2);
+    }
+    else if (data.alarmFlags & ALARM_BODY_TEMP) {
+      lcd.setCursor(0, 0);
+      lcd.print("TEMP CORPS");
+      lcd.setCursor(0, 1);
+      lcd.print(data.bodyTemp, 1);
+      lcd.print((char)223);
+      lcd.print("C");
+    }
+    else {
+      switch (screenIndex) {
+        case 0:
+          lcd.setCursor(0, 0);
+          lcd.print("Etat: NORMAL");
+          lcd.setCursor(0, 1);
+          lcd.print("BT:");
+          lcd.print(data.bodyTemp, 1);
+          lcd.print((char)223);
+          lcd.print("C");
+          break;
+
+        case 1:
+          lcd.setCursor(0, 0);
+          lcd.print("AT:");
+          lcd.print(data.ambientTemp, 1);
+          lcd.print((char)223);
+          lcd.print("C");
+          lcd.setCursor(0, 1);
+          lcd.print("HU:");
+          lcd.print(data.humidity, 1);
+          lcd.print("%");
+          break;
+
+        case 2:
+          lcd.setCursor(0, 0);
+          lcd.print("HR:");
+          if (data.heartRate == 0) lcd.print("--");
+          else lcd.print(data.heartRate);
+          lcd.print(" bpm");
+
+          lcd.setCursor(0, 1);
+          lcd.print("SpO2:");
+          if (data.spO2 == 0) lcd.print("--");
+          else lcd.print(data.spO2);
+          lcd.print("%");
+          break;
+
+        case 3:
+          lcd.setCursor(0, 0);
+          lcd.print("Smoke:");
+          lcd.print(data.smokeLevel);
+          lcd.setCursor(0, 1);
+          lcd.print("Sound:");
+          lcd.print(data.soundLevel);
+          break;
+
+        case 4:
+          lcd.setCursor(0, 0);
+          lcd.print("No Motion:");
+          lcd.print(data.motionDuration);
+          lcd.print(" s");
+          break;
+      }
+
+      screenIndex = (screenIndex + 1) % 5;
+    }
+
+    vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(3000));
+  }
+}
