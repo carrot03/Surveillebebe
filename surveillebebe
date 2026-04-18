@@ -1,3 +1,8 @@
+// ========================================================
+// the values put here are for prototype purposes and they
+// must be changed when using it in real life.
+// ========================================================
+
 #include <Arduino_FreeRTOS.h>
 #include <queue.h>
 #include <semphr.h>
